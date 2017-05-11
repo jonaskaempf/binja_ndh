@@ -5,6 +5,9 @@ from ctypes import c_uint16, c_int8
 from binaryninja import *
 
 '''
+
+NDH architecture description. Refer to https://github.com/JonathanSalwan/VMNDH-2k12
+
 /*
 ** vmndh - Release v0.1
 ** Jonathan Salwan - http://twitter.com/JonathanSalwan
@@ -255,6 +258,12 @@ from binaryninja import *
  *
  *  --------------------------------------
  *
+
+    test r1 r2
+
+    r1 == 0 && r2 == 0  -> zf = 1
+    _                   -> zf = 0
+
  *
  *  -------------------------------------- BF/AF Flag:
  *
@@ -264,6 +273,15 @@ from binaryninja import *
  *
  *  AF & BF is used for JA and JB instructions.
  *
+
+https://github.com/JonathanSalwan/VMNDH-2k12/blob/master/src_vm/op_cmp.c#L36-L59:
+
+    cmp r1 r2
+
+    r1 == r2 -> zf = 1, af = 0, bf = 0
+    r1 > r2  -> zf = 0, af = 1, bf = 0
+    r1 < r2  -> zf = 0, af = 0, bf = 1
+
  *  --------------------------------------
  *
  *  ****************************************/
@@ -409,23 +427,23 @@ RegNames = {
     6: 'r6', 7: 'r7', 8: 'sp', 9: 'bp'
 }
 
-def _get_pseudo_flag(opcode):
+def _derive_flag(opcode):
     '''Determine op format (i.e. flag type) for ops that don't include flag'''
     if opcode in [OP_RET, OP_SYSCALL, OP_NOP, OP_END]:
         return OP_FLAG_EMPTY
 
     elif opcode in [OP_DEC, OP_INC, OP_NOT, OP_POP]:
         return OP_FLAG_REG
-    
+
     elif opcode in [OP_TEST, OP_XCHG]:
         return OP_FLAG_REG_REG
-    
+
     elif opcode in [OP_JMPS]:
         return OP_FLAG_DIRECT08
-    
+
     elif opcode in [OP_JZ, OP_JA, OP_JB, OP_JNZ, OP_JMPL]:
         return OP_FLAG_DIRECT16
-    
+
     else:
         return None
 
@@ -442,14 +460,14 @@ FlagShortLong = [ OP_FLAG_REG_DIRECT16, OP_FLAG_REGINDIRECT_DIRECT16]
 
 def _decode_instr(data, addr):
     '''
-    Decode instruction into length, opcode, flag, args, where
+    Decode instruction into (length, opcode, flag, args), where
 
         length = instruction length in bytes
         opcode = one of OP_*
-        flag = flag specifying format of 'args' (may be contained in length
+        flag = flag specifying format of 'args' (may be explicitly contained in instruction,
             or derived from opcode)
         args = list of args
-    
+
     '''
     opcode = ord(data[0])
     if opcode not in OpMnemonic:
@@ -458,11 +476,11 @@ def _decode_instr(data, addr):
 
     n = 1
 
-    flag = _get_pseudo_flag(opcode)
+    flag = _derive_flag(opcode)
     if flag is None:    # then flag must be included in data
         flag = ord(data[n])
         n += 1
-    
+
     if flag == OP_FLAG_EMPTY:
         return n, opcode, flag, []
     elif flag in FlagShortShort:
@@ -478,7 +496,7 @@ def _decode_instr(data, addr):
         return n + 2, opcode, flag, [imm16]
 
 
-# Short hands
+# Shorthands
 _d_txt = InstructionTextTokenType.TextToken
 _d_instr = InstructionTextTokenType.InstructionToken
 _d_opSep = InstructionTextTokenType.OperandSeparatorToken
@@ -491,9 +509,9 @@ _d_floatLit = InstructionTextTokenType.FloatingPointToken
 _dI = InstructionTextToken
 
 def _disassemble(addr, length, opcode, flag, args):
-    tokens = [ _dI( _d_instr, OpMnemonic[opcode](flag) ), _dI( _d_opSep, ' ' )]
+    tokens = [ _dI( _d_instr, OpMnemonic[opcode](flag) ) ]
 
-    # TODO: Defined outside closure for better performance?
+    # TODO: Define outside closure for better performance?
     def reg(r): return [ _dI( _d_regName, RegNames[r]) ]
     def indirect(r): return [ _dI( _d_bMem, '[' ), _dI( _d_regName, RegNames[r] ), _dI( _d_eMem, ']' )]
     def imm08(x): return [ _dI( _d_intLit, hex(x), x )]
@@ -560,6 +578,9 @@ def _disassemble(addr, length, opcode, flag, args):
         tokens += comma()
         tokens += indirect(args[1])
 
+    if len(tokens) > 1:     # non-empty opcode
+        tokens.insert(1, _dI( _d_opSep, ' ' ))
+
     return tokens
 
 
@@ -590,7 +611,9 @@ class NDH(Architecture):
     flag_write_types = []
     flags_written_by_flag_write_type = { }
     flag_roles = {
-        'zf': FlagRole.ZeroFlagRole
+        'zf': FlagRole.ZeroFlagRole,
+        'af': FlagRole.SpecialFlagRole,
+        'bf': FlagRole.SpecialFlagRole,
     }
     flags_required_for_flag_condition = { }
 
@@ -598,7 +621,7 @@ class NDH(Architecture):
         return _decode_instr(data, addr)
 
     def perform_get_instruction_info(self, data, addr):
-        length, opcode, flag, args = self._decode(data, addr) 
+        length, opcode, flag, args = self._decode(data, addr)
         if length is None:
             return None
 
@@ -608,23 +631,26 @@ class NDH(Architecture):
         # Branching
         if opcode in [OP_RET]:
             info.add_branch(BranchType.FunctionReturn)
-        
+
         elif opcode in [OP_JMPL]:
             info.add_branch(BranchType.UnconditionalBranch, uint16(args[0] + addr + length))
 
         elif opcode in [OP_JZ, OP_JNZ, OP_JA, OP_JB]:
             info.add_branch(BranchType.TrueBranch, uint16(args[0] + addr + length))
             info.add_branch(BranchType.FalseBranch, uint16(addr + length))
-        
+
         elif opcode in [OP_JMPS]:
             info.add_branch(BranchType.UnconditionalBranch, int8(args[0]) + addr + length)
-        
+
         elif opcode in [OP_CALL]:
             if flag == OP_FLAG_REG:
                 info.add_branch(BranchType.CallDestination)
 
             elif flag == OP_FLAG_DIRECT16:
                 info.add_branch(BranchType.CallDestination, uint16(args[0] + addr + length))
+
+        elif opcode in [OP_SYSCALL]:
+            info.add_branch(BranchType.SystemCall)
 
         return info
 
@@ -634,10 +660,9 @@ class NDH(Architecture):
         return tokens, length
 
     def perform_get_instruction_low_level_il(self, data, addr, il):
-        #length, opcode, flag, args = self._decode(data, addr)
-        #il.append(il.unimplemented())
-        #return length
-        return None
+        length, opcode, flag, args = self._decode(data, addr)
+        il.append(il.unimplemented())
+        return length
 
 
 class NDHView(BinaryView):
@@ -651,6 +676,29 @@ class NDHView(BinaryView):
     def is_valid_for_data(cls, data):
         hdr = data.read(0, 4)
         return hdr == '.NDH'
+
+    @staticmethod
+    def name_syscall_wrappers(bv):
+        '''Hackish identification and renaming of syscall wrappers; does not rely on LLIL as it should!'''
+        syscall_blocks = []
+        for func in bv.functions:
+            if len(func.basic_blocks) != 1:
+                continue
+            else:
+                block = func.basic_blocks[0]
+                prev = None
+                for ln in block.disassembly_text:
+                    if 'syscall' in [str(t) for t in ln.tokens]:
+                        syscall_blocks.append((block, prev))
+                        break
+                    prev = ln
+
+        for block, r0 in syscall_blocks:
+            syscall_num = r0.tokens[-1].value
+            for key, value in globals().items():
+                if key.startswith('SYS_') and value == syscall_num:
+                    bv.define_user_symbol(Symbol(SymbolType.FunctionSymbol, block.start, key.lower()))
+
 
     def init(self):
         self.platform = Architecture['ndh'].standalone_platform
@@ -673,6 +721,12 @@ class NDHView(BinaryView):
         self.add_auto_segment(load_addr, text_sz, hdr_sz, text_sz,
             SegmentFlag.SegmentReadable | SegmentFlag.SegmentExecutable)
 
+        # Some typical symbols
+        self.define_auto_symbol(Symbol(SymbolType.FunctionSymbol, self.entry_addr, "_entry"))
+
+        PluginCommand.register('Name syscall wrappers', 'Attempt to identify and name NDH syscall wrappers',
+                NDHView.name_syscall_wrappers)
+
         return True
 
     def perform_is_valid_offset(self, addr):
@@ -687,3 +741,4 @@ class NDHView(BinaryView):
 
 NDH.register()
 NDHView.register()
+
