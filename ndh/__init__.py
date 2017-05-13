@@ -6,7 +6,9 @@ from binaryninja import *
 
 '''
 
-NDH architecture description. Refer to https://github.com/JonathanSalwan/VMNDH-2k12
+NDH architecture description taken from https://github.com/JonathanSalwan/VMNDH-2k12.
+
+https://github.com/JonathanSalwan/VMNDH-2k12/blob/master/includes/op.h:
 
 /*
 ** vmndh - Release v0.1
@@ -300,6 +302,12 @@ OP_FLAG_REG_REGINDIRECT = 0x0a
 
 OP_FLAG_EMPTY = 0xff
 
+# Encode operands in bitmask (src | dst): xxxx | yyyy
+OPERAND_REG = 1 << 0
+OPERAND_DIRECT08 = 1 << 1
+OPERAND_DIRECT16 = 1 << 2
+OPERAND_REGINDIRECT = 1 << 3
+
 REG_0 = 0x00
 REG_1 = 0x01
 REG_2 = 0x02
@@ -381,41 +389,62 @@ SYS_PAUSE = 0x14
 
 #endif     /* !__OP_H__ */
 
+FlagMask = {
+    OP_FLAG_EMPTY: (0, 0),
+    OP_FLAG_REG: (OPERAND_REG, 0),
+    OP_FLAG_DIRECT08: (OPERAND_DIRECT08, 0),
+    OP_FLAG_DIRECT16: (OPERAND_DIRECT16, 0),
+    OP_FLAG_REG_REG: (OPERAND_REG, OPERAND_REG),
+    OP_FLAG_REG_DIRECT08: (OPERAND_REG, OPERAND_DIRECT08),
+    OP_FLAG_REG_DIRECT16: (OPERAND_REG, OPERAND_DIRECT16),
+    OP_FLAG_REGINDIRECT_REG: (OPERAND_REGINDIRECT, OPERAND_REG),
+    OP_FLAG_REG_REGINDIRECT: (OPERAND_REG, OPERAND_REGINDIRECT),
+    OP_FLAG_REGINDIRECT_REGINDIRECT: (OPERAND_REGINDIRECT, OPERAND_REGINDIRECT),
+    OP_FLAG_REGINDIRECT_DIRECT08: (OPERAND_REGINDIRECT, OPERAND_DIRECT08),
+    OP_FLAG_REGINDIRECT_DIRECT16: (OPERAND_REGINDIRECT, OPERAND_DIRECT16),
+}
+def ParseFlag(flag):
+    mask = FlagMask[flag]
+    op0, op1 = FlagMask[flag]
+    op0_sz = 1 if op0 == OPERAND_DIRECT08 else 2
+    op1_sz = 1 if op1 == OPERAND_DIRECT08 else 2
+    return op0, op0_sz, op1, op1_sz
+
 OpMnemonic = {
-    OP_PUSH    : lambda f: 'push' + flag_suffix(f),
-    OP_POP     : lambda f: 'pop',
-    OP_MOV     : lambda f: 'mov' + flag_suffix(f),
     OP_ADD     : lambda f: 'add' + flag_suffix(f),
-    OP_SUB     : lambda f: 'sub' + flag_suffix(f),
-    OP_MUL     : lambda f: 'mul' + flag_suffix(f),
-    OP_DIV     : lambda f: 'div' + flag_suffix(f),
-    OP_INC     : lambda f: 'inc',
-    OP_DEC     : lambda f: 'dec',
-    OP_OR      : lambda f: 'or' + flag_suffix(f),
     OP_AND     : lambda f: 'and' + flag_suffix(f),
-    OP_XOR     : lambda f: 'xor' + flag_suffix(f),
-    OP_NOT     : lambda f: 'not',
-    OP_JZ      : lambda f: 'jz',
-    OP_JNZ     : lambda f: 'jnz',
-    OP_JMPS    : lambda f: 'jmps',
-    OP_TEST    : lambda f: 'test',
-    OP_CMP     : lambda f: 'cmp' + flag_suffix(f),
     OP_CALL    : lambda f: 'call',
-    OP_RET     : lambda f: 'ret',
-    OP_JMPL    : lambda f: 'jmpl',
+    OP_CMP     : lambda f: 'cmp' + flag_suffix(f),
+    OP_DEC     : lambda f: 'dec',
+    OP_DIV     : lambda f: 'div' + flag_suffix(f),
     OP_END     : lambda f: 'end',
-    OP_XCHG    : lambda f: 'xchg',
+    OP_INC     : lambda f: 'inc',
     OP_JA      : lambda f: 'ja',
     OP_JB      : lambda f: 'jb',
-    OP_SYSCALL : lambda f: 'syscall',
+    OP_JMPL    : lambda f: 'jmpl',
+    OP_JMPS    : lambda f: 'jmps',
+    OP_JNZ     : lambda f: 'jnz',
+    OP_JZ      : lambda f: 'jz',
+    OP_MOV     : lambda f: 'mov' + flag_suffix(f),
+    OP_MUL     : lambda f: 'mul' + flag_suffix(f),
     OP_NOP     : lambda f: 'nop',
+    OP_NOT     : lambda f: 'not',
+    OP_OR      : lambda f: 'or' + flag_suffix(f),
+    OP_POP     : lambda f: 'pop',
+    OP_PUSH    : lambda f: 'push' + flag_suffix(f),
+    OP_RET     : lambda f: 'ret',
+    OP_SUB     : lambda f: 'sub' + flag_suffix(f),
+    OP_SYSCALL : lambda f: 'syscall',
+    OP_TEST    : lambda f: 'test',
+    OP_XCHG    : lambda f: 'xchg',
+    OP_XOR     : lambda f: 'xor' + flag_suffix(f),
 }
 
 def flag_suffix(f):
     if f in [OP_FLAG_DIRECT08, OP_FLAG_REG_DIRECT08]:
-        return '.b'
+        return 'b'
     elif f in [OP_FLAG_DIRECT16, OP_FLAG_REG_DIRECT16]:
-        return '.l'
+        return 'l'
     else:
         return ''
 
@@ -584,6 +613,217 @@ def _disassemble(addr, length, opcode, flag, args):
     return tokens
 
 
+# Lifting of operands
+_lift_operand = {
+    OPERAND_REG: lambda il, arg: il.reg(2, RegNames[arg]),
+    OPERAND_DIRECT08: lambda il, arg: il.const(1, arg),
+    OPERAND_DIRECT16: lambda il, arg: il.const(2, arg),
+    # Right-hand side (src)
+    OPERAND_REGINDIRECT: lambda il, arg: il.load(2, il.reg(2, RegNames[arg]))
+}
+
+_WS = 2
+
+def _lift_mov(il, flag, args):
+    dst_t, dst_sz, src_t, src_sz = ParseFlag(flag)
+
+    if dst_t == OPERAND_REG:
+        src = _lift_operand[src_t](il, args[1])
+        expr = il.set_reg(src_sz, RegNames[args[0]], src)
+
+    elif dst_t == OPERAND_REGINDIRECT:
+        dst = il.reg(_WS, RegNames[args[0]])
+        src = _lift_operand[src_t](il, args[1])
+        expr = il.store(src_sz, dst, src)
+
+    else:
+        log_error('Invalid mov instruction')
+        expr = il.unimplemented()
+
+    il.append(expr)
+
+def _lift_cond_branch(il, cond, true_target, false_target):
+    '''
+    https://github.com/joshwatson/binaryninja-msp430/blob/master/__init__.py#L329-L363
+
+    For NDH, we have JNZ, JZ, JA and JB.
+    '''
+    t = il.get_label_for_address(Architecture['ndh'], true_target)
+
+    if t is None:
+        # t is not an address in the current function scope.
+        t = LowLevelILLabel()
+        indirect = True
+    else:
+        indirect = False
+
+    f_label_found = True
+    f = il.get_label_for_address(Architecture['ndh'], false_target)
+
+    if f is None:
+        f = LowLevelILLabel()
+        f_label_found = False
+
+    il.append(il.if_expr(cond, t, f))
+
+    if indirect:
+        # If the destination is not in the current function,
+        # then a jump, rather than a goto, needs to be added to
+        # the IL.
+        il.mark_label(t)
+        il.append(il.jump(il.const(2, true_target)))
+
+    if not f_label_found:
+        il.mark_label(f)
+
+
+def _lift(il, addr, length, opcode, flag, args):
+    if opcode == None: il.append(il.unimplemented())
+    elif opcode == OP_ADD     :
+        dst_t, dst_sz, src_t, src_sz = ParseFlag(flag)
+        dst = _lift_operand[dst_t](il, args[0])
+        src = _lift_operand[src_t](il, args[1])
+        rhs = il.add(dst_sz, dst, src, flags='z')
+        il.append(il.set_reg(dst_sz, RegNames[args[0]], rhs))
+
+    elif opcode == OP_AND     :
+        dst_t, dst_sz, src_t, src_sz = ParseFlag(flag)
+        dst = _lift_operand[dst_t](il, args[0])
+        src = _lift_operand[src_t](il, args[1])
+        rhs = il.and_expr(dst_sz, dst, src, flags='z')
+        il.append(il.set_reg(dst_sz, RegNames[args[0]], rhs))
+
+    elif opcode == OP_CALL    :
+        dst_t, dst_sz, _, _ = ParseFlag(flag)
+        if dst_t == OPERAND_REG:
+            il.append(il.unimplemented())
+        elif dst_t == OPERAND_DIRECT16:
+            addr_calc = il.const(_WS, uint16(addr + length + args[0]))
+            il.append(il.call(addr_calc))
+
+    # TODO: Implement
+    elif opcode == OP_CMP     : il.append(il.unimplemented())
+    elif opcode == OP_DEC     :
+        dst_t, dst_sz, _, _ = ParseFlag(flag)
+        rhs = il.sub(2, _lift_operand[dst_t](il, args[0]), il.const(2, 1), flags=None)
+        il.append(il.set_reg(dst_sz, RegNames[args[0]], rhs))
+
+    elif opcode == OP_DIV     :
+        dst_t, dst_sz, src_t, src_sz = ParseFlag(flag)
+        dst = _lift_operand[dst_t](il, args[0])
+        src = _lift_operand[src_t](il, args[1])
+        rhs = il.div_unsigned(dst_sz, dst, src, flags='z')
+        il.append(il.set_reg(dst_sz, RegNames[args[0]], rhs))
+
+    # TODO: Why you no work!?
+    elif opcode == OP_END     :
+        #il.append(il.no_ret())
+        il.append(il.unimplemented())
+
+    elif opcode == OP_INC     :
+        dst_t, dst_sz, _, _ = ParseFlag(flag)
+        rhs = il.add(2, _lift_operand[dst_t](il, args[0]), il.const(2, 1), flags=None)
+        il.append(il.set_reg(dst_sz, RegNames[args[0]], rhs))
+
+    elif opcode == OP_JA      : il.append(il.unimplemented())
+    elif opcode == OP_JB      : il.append(il.unimplemented())
+    elif opcode == OP_JMPL    :
+        addr_calc = il.const(_WS, uint16(addr + length + args[0]))
+        il.append(il.jump(addr_calc))
+
+    elif opcode == OP_JMPS    :
+        addr_calc = il.const(_WS, uint16(addr + length + int8(args[0])))
+        il.append(il.jump(addr_calc))
+
+    elif opcode == OP_JNZ     :
+        true_addr = uint16(addr + length + args[0])
+        false_addr = uint16(addr + length)
+        true_cond = il.compare_not_equal(1, il.flag('zf'), il.const(1, 0))
+        #true_cond = il.flag_condition(LowLevelILFlagCondition.LLFC_NE)
+        _lift_cond_branch(il, true_cond, true_addr, false_addr)
+        
+    elif opcode == OP_JZ      :
+        true_addr = uint16(addr + length + args[0])
+        false_addr = uint16(addr + length)
+        true_cond = il.compare_equal(1, il.flag('zf'), il.const(1, 0))
+        #true_cond = il.flag_condition(LowLevelILFlagCondition.LLFC_E)
+        _lift_cond_branch(il, true_cond, true_addr, false_addr)
+
+    elif opcode == OP_MOV:
+        _lift_mov(il, flag, args)
+        #il.append(il.unimplemented())
+
+    elif opcode == OP_MUL     :
+        dst_t, dst_sz, src_t, src_sz = ParseFlag(flag)
+        dst = _lift_operand[dst_t](il, args[0])
+        src = _lift_operand[src_t](il, args[1])
+        rhs = il.mult(dst_sz, dst, src, flags='z')
+        il.append(il.set_reg(dst_sz, RegNames[args[0]], rhs))
+
+    elif opcode == OP_NOP     :
+        il.append(il.nop())
+
+    elif opcode == OP_NOT     :
+        dst_t, dst_sz, src_t, src_sz = ParseFlag(flag)
+        dst = _lift_operand[dst_t](il, args[0])
+        rhs = il.not_expr(2, dst, flags='z')
+        il.append(il.set_reg(2, RegNames[args[0]], rhs))
+
+    elif opcode == OP_OR      :
+        dst_t, dst_sz, src_t, src_sz = ParseFlag(flag)
+        dst = _lift_operand[dst_t](il, args[0])
+        src = _lift_operand[src_t](il, args[1])
+        rhs = il.or_expr(dst_sz, dst, src, flags='z')
+        il.append(il.set_reg(dst_sz, RegNames[args[0]], rhs))
+
+    elif opcode == OP_POP     :
+        il.append(il.set_reg(2, RegNames[args[0]], il.pop(2)))
+
+    elif opcode == OP_PUSH    :
+        dst_t, dst_sz, _, _ = ParseFlag(flag)
+        dst = _lift_operand[dst_t](il, args[0])
+        il.append(il.push(dst_sz, dst))
+
+    elif opcode == OP_RET     :
+        il.append(il.ret(il.pop(2)))
+
+    elif opcode == OP_SUB     :
+        dst_t, dst_sz, src_t, src_sz = ParseFlag(flag)
+        dst = _lift_operand[dst_t](il, args[0])
+        src = _lift_operand[src_t](il, args[1])
+        rhs = il.sub(dst_sz, dst, src, flags='z')
+        il.append(il.set_reg(dst_sz, RegNames[args[0]], rhs))
+
+    elif opcode == OP_SYSCALL :
+        il.append(il.system_call())
+
+    elif opcode == OP_TEST    :
+        dst_t, dst_sz, src_t, src_sz = ParseFlag(flag)
+        dst = _lift_operand[dst_t](il, args[0])
+        src = _lift_operand[src_t](il, args[1])
+        test_expr = il.and_expr(2, dst, src, flags='z')
+        il.append(test_expr)
+        #il.flag_condition(il.LowLevelFlagILFlagCondition.LLFC_NE)
+        #il.append(test_expr)
+
+    elif opcode == OP_XCHG    :
+        dst_reg = RegNames[args[0]]
+        dst = il.reg(2, dst_reg)
+        src_reg = RegNames[args[1]]
+        src = il.reg(2, src_reg)
+        tmp = LLIL_TEMP(0)
+        il.append(il.set_reg(2, tmp, src))
+        il.append(il.set_reg(2, src_reg, dst))
+        il.append(il.set_reg(2, dst_reg, il.reg(2, tmp)))
+
+    elif opcode == OP_XOR     :
+        dst_t, dst_sz, src_t, src_sz = ParseFlag(flag)
+        dst = _lift_operand[dst_t](il, args[0])
+        src = _lift_operand[src_t](il, args[1])
+        rhs = il.xor_expr(dst_sz, dst, src, flags='z')
+        il.append(il.set_reg(dst_sz, RegNames[args[0]], rhs))
+
+
 class NDH(Architecture):
     name = 'ndh'
 
@@ -608,8 +848,12 @@ class NDH(Architecture):
     }
     stack_pointer = 'sp'
     flags = [ 'zf', 'af', 'bf' ]
-    flag_write_types = []
-    flags_written_by_flag_write_type = { }
+    flag_write_types = [ 'z', 'a', 'b' ]
+    flags_written_by_flag_write_type = {
+        'z': ['zf'],
+        'a': ['af'],
+        'b': ['bf'],
+    }
     flag_roles = {
         'zf': FlagRole.ZeroFlagRole,
         'af': FlagRole.SpecialFlagRole,
@@ -661,8 +905,12 @@ class NDH(Architecture):
 
     def perform_get_instruction_low_level_il(self, data, addr, il):
         length, opcode, flag, args = self._decode(data, addr)
-        il.append(il.unimplemented())
+        _lift(il, addr, length, opcode, flag, args)
         return length
+
+    def perform_convert_to_nop(self, data, addr):
+        n = len(data)
+        return chr(OP_NOP) * n
 
 
 class NDHView(BinaryView):
