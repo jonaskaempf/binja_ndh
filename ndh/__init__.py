@@ -389,7 +389,7 @@ SYS_PAUSE = 0x14
 
 #endif     /* !__OP_H__ */
 
-FlagMask = {
+FlagToOperandTypes = {
     OP_FLAG_EMPTY: (0, 0),
     OP_FLAG_REG: (OPERAND_REG, 0),
     OP_FLAG_DIRECT08: (OPERAND_DIRECT08, 0),
@@ -404,8 +404,7 @@ FlagMask = {
     OP_FLAG_REGINDIRECT_DIRECT16: (OPERAND_REGINDIRECT, OPERAND_DIRECT16),
 }
 def ParseFlag(flag):
-    mask = FlagMask[flag]
-    op0, op1 = FlagMask[flag]
+    op0, op1 = FlagToOperandTypes[flag]
     op0_sz = 1 if op0 == OPERAND_DIRECT08 else 2
     op1_sz = 1 if op1 == OPERAND_DIRECT08 else 2
     return op0, op0_sz, op1, op1_sz
@@ -441,9 +440,10 @@ OpMnemonic = {
 }
 
 def flag_suffix(f):
-    if f in [OP_FLAG_DIRECT08, OP_FLAG_REG_DIRECT08]:
+    _, op1 = FlagToOperandTypes[f]
+    if op1 == OPERAND_DIRECT08:
         return 'b'
-    elif f in [OP_FLAG_DIRECT16, OP_FLAG_REG_DIRECT16]:
+    elif op1 == OPERAND_DIRECT16:
         return 'l'
     else:
         return ''
@@ -525,92 +525,57 @@ def _decode_instr(data, addr):
         return n + 2, opcode, flag, [imm16]
 
 
-# Shorthands
-_d_txt = InstructionTextTokenType.TextToken
-_d_instr = InstructionTextTokenType.InstructionToken
-_d_opSep = InstructionTextTokenType.OperandSeparatorToken
-_d_regName = InstructionTextTokenType.RegisterToken
-_d_intLit = InstructionTextTokenType.IntegerToken
-_d_posAddr = InstructionTextTokenType.PossibleAddressToken
-_d_bMem = InstructionTextTokenType.BeginMemoryOperandToken
-_d_eMem = InstructionTextTokenType.EndMemoryOperandToken
-_d_floatLit = InstructionTextTokenType.FloatingPointToken
-_dI = InstructionTextToken
+class Dis:
+    '''Namespace for helpers for outputting disassembly tokens'''
+    Txt = InstructionTextTokenType.TextToken
+    Mnemonic = InstructionTextTokenType.InstructionToken
+    Sep = InstructionTextTokenType.OperandSeparatorToken
+    Reg = InstructionTextTokenType.RegisterToken
+    Int = InstructionTextTokenType.IntegerToken
+    Addr = InstructionTextTokenType.PossibleAddressToken
+    Float = InstructionTextTokenType.FloatingPointToken
+    Token = InstructionTextToken
 
-def _disassemble(addr, length, opcode, flag, args):
-    tokens = [ _dI( _d_instr, OpMnemonic[opcode](flag) ) ]
+    tokenize_operand = {
+        0: [],
+        OPERAND_REG: lambda r: [ Dis.Token( Dis.Reg, RegNames[r] ) ],
+        OPERAND_REGINDIRECT: lambda r: [ 
+            Dis.Token( InstructionTextTokenType.BeginMemoryOperandToken, '[' ), 
+            Dis.Token( Dis.Reg, RegNames[r] ), 
+            Dis.Token( InstructionTextTokenType.EndMemoryOperandToken, ']' )
+        ],
+        OPERAND_DIRECT08: lambda x: [ Dis.Token( Dis.Int, hex(x), x ) ],
+        OPERAND_DIRECT16: lambda x: [ Dis.Token( Dis.Int, hex(x), x ) ],
+    }
 
-    # TODO: Define outside closure for better performance?
-    def reg(r): return [ _dI( _d_regName, RegNames[r]) ]
-    def indirect(r): return [ _dI( _d_bMem, '[' ), _dI( _d_regName, RegNames[r] ), _dI( _d_eMem, ']' )]
-    def imm08(x): return [ _dI( _d_intLit, hex(x), x )]
-    def imm16(x): return [ _dI( _d_intLit, hex(x), x )]
-    def addr16(x): return [ _dI( _d_posAddr, hex(x), x )]
-    def comma(): return [ _dI( _d_opSep, ', ' )]
+    @staticmethod
+    def disassemble(addr, length, opcode, flag, args):
+        tokens = [ Dis.Token( Dis.Mnemonic, OpMnemonic[opcode](flag) ) ]
 
-    if flag == OP_FLAG_EMPTY:
-        pass
+        def addr16(x): return [ Dis.Token( Dis.Addr, hex(x), x )]
+        comma = [ Dis.Token( Dis.Sep, ', ' )]
 
-    elif flag == OP_FLAG_REG_REG:
-        tokens += reg(args[0])
-        tokens += comma()
-        tokens += reg(args[1])
+        # Special-case jumps since their operand can be converted to address
+        if flag == OP_FLAG_EMPTY:
+            pass
 
-    elif flag == OP_FLAG_REG_DIRECT08:
-        tokens += reg(args[0])
-        tokens += comma()
-        tokens += imm08(args[1])
+        elif flag == OP_FLAG_DIRECT16 and opcode in [OP_CALL, OP_JMPL, OP_JZ, OP_JNZ, OP_JA, OP_JB]:
+            tokens += addr16(uint16(args[0] + addr + length))
 
-    elif flag == OP_FLAG_REG_DIRECT16:
-        tokens += reg(args[0])
-        tokens += comma()
-        tokens += imm16(args[1])
+        elif flag == OP_FLAG_DIRECT08 and opcode in [OP_JMPS]:
+            tokens += addr16(int8(args[0]) + addr + length)
 
-    elif flag == OP_FLAG_REG:
-        tokens += reg(args[0])
+        else:
+            op0, _, op1, _ = ParseFlag(flag)
+            tokens += Dis.tokenize_operand[op0](args[0])
+            if op1 != 0:
+                tokens += comma
+                tokens += Dis.tokenize_operand[op1](args[1])
 
-    # Jumps to addr + length + (uint16)imm16
-    elif flag == OP_FLAG_DIRECT16 and opcode in [OP_CALL, OP_JMPL, OP_JZ, OP_JNZ, OP_JA, OP_JB]:
-        tokens += addr16(uint16(args[0] + addr + length))
+        if len(tokens) > 1:     # non-empty opcode
+            tokens.insert(1, Dis.Token( Dis.Sep, ' ' ))
 
-    elif flag == OP_FLAG_DIRECT16:
-        tokens += imm16(args[0])
-
-    elif flag == OP_FLAG_DIRECT08 and opcode in [OP_JMPS]:
-        tokens += addr16(int8(args[0]) + addr + length)
-
-    elif flag == OP_FLAG_DIRECT08:
-        tokens += imm08(args[0])
-
-    elif flag == OP_FLAG_REGINDIRECT_REG:
-        tokens += indirect(args[0])
-        tokens += comma()
-        tokens += reg(args[1])
-
-    elif flag == OP_FLAG_REGINDIRECT_DIRECT08:
-        tokens += indirect(args[0])
-        tokens += comma()
-        tokens += imm08(args[1])
-
-    elif flag == OP_FLAG_REGINDIRECT_DIRECT16:
-        tokens += indirect(args[0])
-        tokens += comma()
-        tokens += imm16(args[1])
-
-    elif flag == OP_FLAG_REGINDIRECT_REGINDIRECT:
-        tokens += indirect(args[0])
-        tokens += comma()
-        tokens += indirect(args[1])
-
-    elif flag == OP_FLAG_REG_REGINDIRECT:
-        tokens += reg(args[0])
-        tokens += comma()
-        tokens += indirect(args[1])
-
-    if len(tokens) > 1:     # non-empty opcode
-        tokens.insert(1, _dI( _d_opSep, ' ' ))
-
-    return tokens
+        return tokens
 
 
 # Lifting of operands
@@ -900,7 +865,7 @@ class NDH(Architecture):
 
     def perform_get_instruction_text(self, data, addr):
         length, opcode, flag, args = self._decode(data, addr)
-        tokens = _disassemble(addr, length, opcode, flag, args)
+        tokens = Dis.disassemble(addr, length, opcode, flag, args)
         return tokens, length
 
     def perform_get_instruction_low_level_il(self, data, addr, il):
