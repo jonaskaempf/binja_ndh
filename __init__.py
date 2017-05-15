@@ -578,215 +578,226 @@ class Dis:
         return tokens
 
 
-# Lifting of operands
-_lift_operand = {
-    OPERAND_REG: lambda il, arg: il.reg(2, RegNames[arg]),
-    OPERAND_DIRECT08: lambda il, arg: il.const(1, arg),
-    OPERAND_DIRECT16: lambda il, arg: il.const(2, arg),
-    # Right-hand side (src)
-    OPERAND_REGINDIRECT: lambda il, arg: il.load(2, il.reg(2, RegNames[arg]))
-}
+class Lift:
+    '''Namespace for lifting to Lifted IL'''
+    word_size = 2
+    addr_size = 2
 
-_WS = 2
+    operand = {
+        OPERAND_REG: lambda il, arg: il.reg(2, RegNames[arg]),
+        OPERAND_DIRECT08: lambda il, arg: il.const(1, arg),
+        OPERAND_DIRECT16: lambda il, arg: il.const(2, arg),
+        # Right-hand side (src)
+        OPERAND_REGINDIRECT: lambda il, arg: il.load(2, il.reg(2, RegNames[arg]))
+    }
 
-def _lift_mov(il, flag, args):
-    dst_t, dst_sz, src_t, src_sz = ParseFlag(flag)
+    @staticmethod
+    def cond_branch(il, cond, true_target, false_target):
+        '''
+        https://github.com/joshwatson/binaryninja-msp430/blob/master/__init__.py#L329-L363
 
-    if dst_t == OPERAND_REG:
-        src = _lift_operand[src_t](il, args[1])
-        expr = il.set_reg(src_sz, RegNames[args[0]], src)
+        For NDH, we have JNZ, JZ, JA and JB.
+        '''
+        t = il.get_label_for_address(Architecture['ndh'], true_target)
 
-    elif dst_t == OPERAND_REGINDIRECT:
-        dst = il.reg(_WS, RegNames[args[0]])
-        src = _lift_operand[src_t](il, args[1])
-        expr = il.store(src_sz, dst, src)
+        if t is None:
+            # t is not an address in the current function scope.
+            t = LowLevelILLabel()
+            indirect = True
+        else:
+            indirect = False
 
-    else:
-        log_error('Invalid mov instruction')
-        expr = il.unimplemented()
+        f_label_found = True
+        f = il.get_label_for_address(Architecture['ndh'], false_target)
 
-    il.append(expr)
+        if f is None:
+            f = LowLevelILLabel()
+            f_label_found = False
 
-def _lift_cond_branch(il, cond, true_target, false_target):
-    '''
-    https://github.com/joshwatson/binaryninja-msp430/blob/master/__init__.py#L329-L363
+        il.append(il.if_expr(cond, t, f))
 
-    For NDH, we have JNZ, JZ, JA and JB.
-    '''
-    t = il.get_label_for_address(Architecture['ndh'], true_target)
+        if indirect:
+            # If the destination is not in the current function,
+            # then a jump, rather than a goto, needs to be added to
+            # the IL.
+            il.mark_label(t)
+            il.append(il.jump(il.const(Lift.addr_size, true_target)))
 
-    if t is None:
-        # t is not an address in the current function scope.
-        t = LowLevelILLabel()
-        indirect = True
-    else:
-        indirect = False
+        if not f_label_found:
+            il.mark_label(f)
 
-    f_label_found = True
-    f = il.get_label_for_address(Architecture['ndh'], false_target)
+    @staticmethod
+    def lifted_il(il, addr, length, opcode, flag, args):
+        '''Lift instruction to Lifted IL'''
+        if opcode == None: il.append(il.unimplemented())
+        elif opcode == OP_ADD     :
+            dst_t, dst_sz, src_t, src_sz = ParseFlag(flag)
+            dst = Lift.operand[dst_t](il, args[0])
+            src = Lift.operand[src_t](il, args[1])
+            rhs = il.add(dst_sz, dst, src, flags='z')
+            il.append(il.set_reg(dst_sz, RegNames[args[0]], rhs))
 
-    if f is None:
-        f = LowLevelILLabel()
-        f_label_found = False
+        elif opcode == OP_AND     :
+            dst_t, dst_sz, src_t, src_sz = ParseFlag(flag)
+            dst = Lift.operand[dst_t](il, args[0])
+            src = Lift.operand[src_t](il, args[1])
+            rhs = il.and_expr(dst_sz, dst, src, flags='z')
+            il.append(il.set_reg(dst_sz, RegNames[args[0]], rhs))
 
-    il.append(il.if_expr(cond, t, f))
+        elif opcode == OP_CALL    :
+            dst_t, dst_sz, _, _ = ParseFlag(flag)
+            if dst_t == OPERAND_REG:
+                il.append(il.unimplemented())
+            elif dst_t == OPERAND_DIRECT16:
+                addr_calc = il.const(Lift.word_size, uint16(addr + length + args[0]))
+                il.append(il.call(addr_calc))
 
-    if indirect:
-        # If the destination is not in the current function,
-        # then a jump, rather than a goto, needs to be added to
-        # the IL.
-        il.mark_label(t)
-        il.append(il.jump(il.const(2, true_target)))
+        # TODO: Implement
+        elif opcode == OP_CMP     : il.append(il.unimplemented())
+        elif opcode == OP_DEC     :
+            dst_t, dst_sz, _, _ = ParseFlag(flag)
+            rhs = il.sub(2, Lift.operand[dst_t](il, args[0]), il.const(2, 1), flags=None)
+            il.append(il.set_reg(dst_sz, RegNames[args[0]], rhs))
 
-    if not f_label_found:
-        il.mark_label(f)
+        elif opcode == OP_DIV     :
+            dst_t, dst_sz, src_t, src_sz = ParseFlag(flag)
+            dst = Lift.operand[dst_t](il, args[0])
+            src = Lift.operand[src_t](il, args[1])
+            rhs = il.div_unsigned(dst_sz, dst, src, flags='z')
+            il.append(il.set_reg(dst_sz, RegNames[args[0]], rhs))
 
-
-def _lift(il, addr, length, opcode, flag, args):
-    if opcode == None: il.append(il.unimplemented())
-    elif opcode == OP_ADD     :
-        dst_t, dst_sz, src_t, src_sz = ParseFlag(flag)
-        dst = _lift_operand[dst_t](il, args[0])
-        src = _lift_operand[src_t](il, args[1])
-        rhs = il.add(dst_sz, dst, src, flags='z')
-        il.append(il.set_reg(dst_sz, RegNames[args[0]], rhs))
-
-    elif opcode == OP_AND     :
-        dst_t, dst_sz, src_t, src_sz = ParseFlag(flag)
-        dst = _lift_operand[dst_t](il, args[0])
-        src = _lift_operand[src_t](il, args[1])
-        rhs = il.and_expr(dst_sz, dst, src, flags='z')
-        il.append(il.set_reg(dst_sz, RegNames[args[0]], rhs))
-
-    elif opcode == OP_CALL    :
-        dst_t, dst_sz, _, _ = ParseFlag(flag)
-        if dst_t == OPERAND_REG:
+        # TODO: Why you no work!?
+        elif opcode == OP_END     :
+            #il.append(il.no_ret())
             il.append(il.unimplemented())
-        elif dst_t == OPERAND_DIRECT16:
-            addr_calc = il.const(_WS, uint16(addr + length + args[0]))
-            il.append(il.call(addr_calc))
 
-    # TODO: Implement
-    elif opcode == OP_CMP     : il.append(il.unimplemented())
-    elif opcode == OP_DEC     :
-        dst_t, dst_sz, _, _ = ParseFlag(flag)
-        rhs = il.sub(2, _lift_operand[dst_t](il, args[0]), il.const(2, 1), flags=None)
-        il.append(il.set_reg(dst_sz, RegNames[args[0]], rhs))
+        elif opcode == OP_INC     :
+            dst_t, dst_sz, _, _ = ParseFlag(flag)
+            rhs = il.add(2, Lift.operand[dst_t](il, args[0]), il.const(2, 1), flags=None)
+            il.append(il.set_reg(dst_sz, RegNames[args[0]], rhs))
 
-    elif opcode == OP_DIV     :
-        dst_t, dst_sz, src_t, src_sz = ParseFlag(flag)
-        dst = _lift_operand[dst_t](il, args[0])
-        src = _lift_operand[src_t](il, args[1])
-        rhs = il.div_unsigned(dst_sz, dst, src, flags='z')
-        il.append(il.set_reg(dst_sz, RegNames[args[0]], rhs))
+        elif opcode == OP_JA      :
+            true_addr = uint16(addr + length + args[0])
+            false_addr = uint16(addr + length)
+            true_cond = il.compare_equal(1, il.flag('a'), il.const(1, 0))
+            Lift.cond_branch(il, true_cond, true_addr, false_addr)
 
-    # TODO: Why you no work!?
-    elif opcode == OP_END     :
-        #il.append(il.no_ret())
-        il.append(il.unimplemented())
+        elif opcode == OP_JB      :
+            true_addr = uint16(addr + length + args[0])
+            false_addr = uint16(addr + length)
+            true_cond = il.compare_equal(1, il.flag('b'), il.const(1, 0))
+            Lift.cond_branch(il, true_cond, true_addr, false_addr)
 
-    elif opcode == OP_INC     :
-        dst_t, dst_sz, _, _ = ParseFlag(flag)
-        rhs = il.add(2, _lift_operand[dst_t](il, args[0]), il.const(2, 1), flags=None)
-        il.append(il.set_reg(dst_sz, RegNames[args[0]], rhs))
+        elif opcode == OP_JMPL    :
+            addr_calc = il.const(Lift.word_size, uint16(addr + length + args[0]))
+            il.append(il.jump(addr_calc))
 
-    elif opcode == OP_JA      : il.append(il.unimplemented())
-    elif opcode == OP_JB      : il.append(il.unimplemented())
-    elif opcode == OP_JMPL    :
-        addr_calc = il.const(_WS, uint16(addr + length + args[0]))
-        il.append(il.jump(addr_calc))
+        elif opcode == OP_JMPS    :
+            addr_calc = il.const(Lift.word_size, uint16(addr + length + int8(args[0])))
+            il.append(il.jump(addr_calc))
 
-    elif opcode == OP_JMPS    :
-        addr_calc = il.const(_WS, uint16(addr + length + int8(args[0])))
-        il.append(il.jump(addr_calc))
+        elif opcode == OP_JNZ     :
+            true_addr = uint16(addr + length + args[0])
+            false_addr = uint16(addr + length)
+            true_cond = il.compare_not_equal(1, il.flag('z'), il.const(1, 0))
+            Lift.cond_branch(il, true_cond, true_addr, false_addr)
+            
+        elif opcode == OP_JZ      :
+            true_addr = uint16(addr + length + args[0])
+            false_addr = uint16(addr + length)
+            true_cond = il.compare_equal(1, il.flag('z'), il.const(1, 1))
+            Lift.cond_branch(il, true_cond, true_addr, false_addr)
 
-    elif opcode == OP_JNZ     :
-        true_addr = uint16(addr + length + args[0])
-        false_addr = uint16(addr + length)
-        true_cond = il.compare_not_equal(1, il.flag('zf'), il.const(1, 0))
-        #true_cond = il.flag_condition(LowLevelILFlagCondition.LLFC_NE)
-        _lift_cond_branch(il, true_cond, true_addr, false_addr)
-        
-    elif opcode == OP_JZ      :
-        true_addr = uint16(addr + length + args[0])
-        false_addr = uint16(addr + length)
-        true_cond = il.compare_equal(1, il.flag('zf'), il.const(1, 0))
-        #true_cond = il.flag_condition(LowLevelILFlagCondition.LLFC_E)
-        _lift_cond_branch(il, true_cond, true_addr, false_addr)
+        elif opcode == OP_MOV:
+            dst_t, dst_sz, src_t, src_sz = ParseFlag(flag)
 
-    elif opcode == OP_MOV:
-        _lift_mov(il, flag, args)
-        #il.append(il.unimplemented())
+            if dst_t == OPERAND_REG:
+                src = Lift.operand[src_t](il, args[1])
+                expr = il.set_reg(src_sz, RegNames[args[0]], src)
 
-    elif opcode == OP_MUL     :
-        dst_t, dst_sz, src_t, src_sz = ParseFlag(flag)
-        dst = _lift_operand[dst_t](il, args[0])
-        src = _lift_operand[src_t](il, args[1])
-        rhs = il.mult(dst_sz, dst, src, flags='z')
-        il.append(il.set_reg(dst_sz, RegNames[args[0]], rhs))
+            elif dst_t == OPERAND_REGINDIRECT:
+                dst = il.reg(Lift.word_size, RegNames[args[0]])
+                src = Lift.operand[src_t](il, args[1])
+                expr = il.store(src_sz, dst, src)
 
-    elif opcode == OP_NOP     :
-        il.append(il.nop())
+            else:
+                log_error('Invalid mov instruction: ({:#x}, {}, {}, {}, {})'.format(
+                    addr, length, opcode, flag, args))
+                expr = il.unimplemented()
 
-    elif opcode == OP_NOT     :
-        dst_t, dst_sz, src_t, src_sz = ParseFlag(flag)
-        dst = _lift_operand[dst_t](il, args[0])
-        rhs = il.not_expr(2, dst, flags='z')
-        il.append(il.set_reg(2, RegNames[args[0]], rhs))
+            il.append(expr)
 
-    elif opcode == OP_OR      :
-        dst_t, dst_sz, src_t, src_sz = ParseFlag(flag)
-        dst = _lift_operand[dst_t](il, args[0])
-        src = _lift_operand[src_t](il, args[1])
-        rhs = il.or_expr(dst_sz, dst, src, flags='z')
-        il.append(il.set_reg(dst_sz, RegNames[args[0]], rhs))
+        elif opcode == OP_MUL     :
+            dst_t, dst_sz, src_t, src_sz = ParseFlag(flag)
+            dst = Lift.operand[dst_t](il, args[0])
+            src = Lift.operand[src_t](il, args[1])
+            rhs = il.mult(dst_sz, dst, src, flags='z')
+            il.append(il.set_reg(dst_sz, RegNames[args[0]], rhs))
 
-    elif opcode == OP_POP     :
-        il.append(il.set_reg(2, RegNames[args[0]], il.pop(2)))
+        elif opcode == OP_NOP     :
+            il.append(il.nop())
 
-    elif opcode == OP_PUSH    :
-        dst_t, dst_sz, _, _ = ParseFlag(flag)
-        dst = _lift_operand[dst_t](il, args[0])
-        il.append(il.push(dst_sz, dst))
+        elif opcode == OP_NOT     :
+            dst_t, dst_sz, src_t, src_sz = ParseFlag(flag)
+            dst = Lift.operand[dst_t](il, args[0])
+            rhs = il.not_expr(Lift.word_size, dst, flags='z')
+            il.append(il.set_reg(Lift.word_size, RegNames[args[0]], rhs))
 
-    elif opcode == OP_RET     :
-        il.append(il.ret(il.pop(2)))
+        elif opcode == OP_OR      :
+            dst_t, dst_sz, src_t, src_sz = ParseFlag(flag)
+            dst = Lift.operand[dst_t](il, args[0])
+            src = Lift.operand[src_t](il, args[1])
+            rhs = il.or_expr(dst_sz, dst, src, flags='z')
+            il.append(il.set_reg(dst_sz, RegNames[args[0]], rhs))
 
-    elif opcode == OP_SUB     :
-        dst_t, dst_sz, src_t, src_sz = ParseFlag(flag)
-        dst = _lift_operand[dst_t](il, args[0])
-        src = _lift_operand[src_t](il, args[1])
-        rhs = il.sub(dst_sz, dst, src, flags='z')
-        il.append(il.set_reg(dst_sz, RegNames[args[0]], rhs))
+        elif opcode == OP_POP     :
+            il.append(il.set_reg(2, RegNames[args[0]], il.pop(2)))
 
-    elif opcode == OP_SYSCALL :
-        il.append(il.system_call())
+        elif opcode == OP_PUSH    :
+            dst_t, dst_sz, _, _ = ParseFlag(flag)
+            dst = Lift.operand[dst_t](il, args[0])
+            il.append(il.push(dst_sz, dst))
 
-    elif opcode == OP_TEST    :
-        dst_t, dst_sz, src_t, src_sz = ParseFlag(flag)
-        dst = _lift_operand[dst_t](il, args[0])
-        src = _lift_operand[src_t](il, args[1])
-        test_expr = il.and_expr(2, dst, src, flags='z')
-        il.append(test_expr)
-        #il.flag_condition(il.LowLevelFlagILFlagCondition.LLFC_NE)
-        #il.append(test_expr)
+        elif opcode == OP_RET     :
+            il.append(il.ret(il.pop(Lift.addr_size)))
 
-    elif opcode == OP_XCHG    :
-        dst_reg = RegNames[args[0]]
-        dst = il.reg(2, dst_reg)
-        src_reg = RegNames[args[1]]
-        src = il.reg(2, src_reg)
-        tmp = LLIL_TEMP(0)
-        il.append(il.set_reg(2, tmp, src))
-        il.append(il.set_reg(2, src_reg, dst))
-        il.append(il.set_reg(2, dst_reg, il.reg(2, tmp)))
+        elif opcode == OP_SUB     :
+            dst_t, dst_sz, src_t, src_sz = ParseFlag(flag)
+            dst = Lift.operand[dst_t](il, args[0])
+            src = Lift.operand[src_t](il, args[1])
+            rhs = il.sub(dst_sz, dst, src, flags='z')
+            il.append(il.set_reg(dst_sz, RegNames[args[0]], rhs))
 
-    elif opcode == OP_XOR     :
-        dst_t, dst_sz, src_t, src_sz = ParseFlag(flag)
-        dst = _lift_operand[dst_t](il, args[0])
-        src = _lift_operand[src_t](il, args[1])
-        rhs = il.xor_expr(dst_sz, dst, src, flags='z')
-        il.append(il.set_reg(dst_sz, RegNames[args[0]], rhs))
+        elif opcode == OP_SYSCALL :
+            il.append(il.system_call())
+
+        # TODO Does not seem to work as intended; in LLIL it shows as just "reg", e.g. "r0";
+        #   in x86_64 it shows as "and.b ..." (in LLIL)
+        elif opcode == OP_TEST    :
+            dst_t, dst_sz, src_t, src_sz = ParseFlag(flag)
+            dst = Lift.operand[dst_t](il, args[0])
+            src = Lift.operand[src_t](il, args[1])
+            test_expr = il.and_expr(2, dst, src, flags='z')
+            il.append(test_expr)
+            #il.flag_condition(il.LowLevelFlagILFlagCondition.LLFC_NE)
+            #il.append(test_expr)
+
+        elif opcode == OP_XCHG    :
+            dst_reg = RegNames[args[0]]
+            dst = il.reg(Lift.word_size, dst_reg)
+            src_reg = RegNames[args[1]]
+            src = il.reg(Lift.word_size, src_reg)
+            tmp = LLIL_TEMP(0)
+            il.append(il.set_reg(Lift.word_size, tmp, src))
+            il.append(il.set_reg(Lift.word_size, src_reg, dst))
+            il.append(il.set_reg(Lift.word_size, dst_reg, il.reg(Lift.word_size, tmp)))
+
+        elif opcode == OP_XOR     :
+            dst_t, dst_sz, src_t, src_sz = ParseFlag(flag)
+            dst = Lift.operand[dst_t](il, args[0])
+            src = Lift.operand[src_t](il, args[1])
+            rhs = il.xor_expr(dst_sz, dst, src, flags='z')
+            il.append(il.set_reg(dst_sz, RegNames[args[0]], rhs))
 
 
 class NDH(Architecture):
@@ -812,17 +823,18 @@ class NDH(Architecture):
         'r7': RegisterInfo('r7', 2),
     }
     stack_pointer = 'sp'
-    flags = [ 'zf', 'af', 'bf' ]
-    flag_write_types = [ 'z', 'a', 'b' ]
+    flags = [ 'z', 'a', 'b' ]
+    # BUG in flag_write_types: https://github.com/Vector35/binaryninja-api/issues/513
+    flag_write_types = [ '', 'z', 'a', 'b' ]
     flags_written_by_flag_write_type = {
-        'z': ['zf'],
-        'a': ['af'],
-        'b': ['bf'],
+        'z': ['z'],
+        'a': ['a'],
+        'b': ['b'],
     }
     flag_roles = {
-        'zf': FlagRole.ZeroFlagRole,
-        'af': FlagRole.SpecialFlagRole,
-        'bf': FlagRole.SpecialFlagRole,
+        'z': FlagRole.ZeroFlagRole,
+        'a': FlagRole.SpecialFlagRole,
+        'b': FlagRole.SpecialFlagRole,
     }
     flags_required_for_flag_condition = { }
 
@@ -870,7 +882,7 @@ class NDH(Architecture):
 
     def perform_get_instruction_low_level_il(self, data, addr, il):
         length, opcode, flag, args = self._decode(data, addr)
-        _lift(il, addr, length, opcode, flag, args)
+        Lift.lifted_il(il, addr, length, opcode, flag, args)
         return length
 
     def perform_convert_to_nop(self, data, addr):
